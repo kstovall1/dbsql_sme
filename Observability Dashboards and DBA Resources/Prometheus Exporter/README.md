@@ -20,23 +20,30 @@ metrics exporter  (this + the monitor)   <- runs in the customer's EKS
 Prometheus  --scrape-->  Grafana
 ```
 
-A push-to-Pushgateway variant is possible (the sink would push each poll instead of serving `/metrics`). We chose scrape because the exporter is a long-running service Prometheus can just scrape, and the customer confirmed they also pull metrics. Push only makes sense if the exporter cannot be scraped (for example if it ran as a short-lived Databricks job).
+A push-to-Pushgateway variant is possible (the sink would push each poll instead of serving `/metrics`). We chose scrape because the exporter is a long-running service Prometheus can just scrape, and the customer confirmed on the Sep 16 sync that they also pull metrics. Push only matters if the exporter cannot be scraped (for example if it ran as a short-lived Databricks job).
 
 ## Files
 
 - `prometheus_sink.py` — the `PrometheusSink` class (implements the monitor's `emit(events)` Sink protocol) plus a `start_server()` helper and a runnable demo.
-- `requirements.txt` — `prometheus-client`, `requests`, `pandas`.
+- `test_prometheus_sink.py` — unit tests over the schema mapping, health/state encoding, stale-series removal, and timestamp handling.
+- `requirements.txt` — `prometheus-client` (the sink's only dependency; the monitor brings its own `requests` / `pandas`).
 
 ## Try it standalone
 
 ```bash
 pip install -r requirements.txt
-python "prometheus_sink.py"
+python "prometheus_sink.py"          # binds 127.0.0.1 in the demo
 # then, in another shell:
-curl http://localhost:9877/metrics
+curl http://127.0.0.1:9877/metrics
 ```
 
-The demo emits one synthetic warehouse event every 15s so you can see the gauges render before wiring the real monitor.
+The demo emits one synthetic warehouse event (using the monitor's real keys) every 15s.
+
+## Run the tests
+
+```bash
+python test_prometheus_sink.py       # standalone, or: pytest
+```
 
 ## Wire it into the monitor
 
@@ -44,14 +51,14 @@ The demo emits one synthetic warehouse event every 15s so you can see the gauges
 from prometheus_sink import PrometheusSink
 
 sink = PrometheusSink(namespace="dbsql", port=9877)
-sink.start_server()                       # start /metrics once, at process start
+sink.start_server()                       # start /metrics once, at process start (0.0.0.0 for in-cluster scrape)
 
 settings = DatabricksSQLMonitorSettings(
     databricks_token=os.environ["DATABRICKS_TOKEN"],
     poll_interval_seconds=30,
     warehouse_workspace_map={ "<warehouse_id>": "<workspace_host>" },
-    # use a fixed lookback to avoid the control-warehouse dependency:
-    # leave control_workspace_host / control_warehouse_id unset and rely on long_lb_min_minutes
+    # leave control_workspace_host / control_warehouse_id unset to skip the dynamic
+    # p99 refresh (its SQL query needs a warehouse) and rely on the fixed long_lb_min_minutes
 )
 
 monitor = DatabricksSQLMonitor(settings=settings, sinks=[sink])
@@ -62,18 +69,36 @@ Note: the monitor currently lives as a Databricks notebook file, so it is not im
 
 ## Metrics and labels
 
-Every numeric metric becomes a gauge named `dbsql_<metric_key>`, labeled by `warehouse_id`, `workspace_host`, and `monitor`. Examples: `dbsql_queue_depth`, `dbsql_queue_wait_seconds_p99`, `dbsql_qps`, `dbsql_runtime_seconds_p95`, `dbsql_running_concurrency_p95`, `dbsql_failure_rate_pct`, `dbsql_num_clusters`, `dbsql_max_clusters`.
+Every numeric metric becomes a gauge named `dbsql_<metric_key>`, labeled by `warehouse_id`, `workspace_host`, and `monitor`. The keys are exactly what the monitor emits from `_compute_metrics`, `_snapshot_query_counts_from_history`, and `_fetch_warehouse_status`. Examples:
 
-- `warehouse_health` (string) is encoded numerically as `dbsql_warehouse_health`: `HEALTHY=0`, `DEGRADED=1`, `FAILED=2`, unknown=`-1`. Alert on `>= 1`.
-- `dbsql_last_poll_unixtime` is a freshness signal per warehouse. Alert on `time() - dbsql_last_poll_unixtime` to catch an exporter that has stopped, since the scrape-`up` signal already covers a dead process.
+- Throughput: `dbsql_qps`, `dbsql_qpm`
+- Live counts: `dbsql_current_running_queries`, `dbsql_current_queued_queries`
+- Queue wait seconds: `dbsql_queued_p50_sec`, `dbsql_queued_p95_sec`, `dbsql_queued_p99_sec`, `dbsql_queued_p100_sec`
+- Runtime seconds: `dbsql_runtime_p50_sec`, `dbsql_runtime_p90_sec`, `dbsql_runtime_p95_sec`, `dbsql_runtime_p99_sec`, `dbsql_runtime_p100_sec`
+- Concurrency: `dbsql_running_concurrency_p95`, `dbsql_queued_concurrency_p95` (also p50/p99/p100)
+- Queue-life percent: `dbsql_queue_life_pct_p95` (also p50/p99/p100)
+- Health of the query mix: `dbsql_failure_rate_pct`, `dbsql_spilled_query_pct`
+- Warehouse shape: `dbsql_warehouse_current_clusters`, `dbsql_warehouse_max_num_clusters`, `dbsql_warehouse_min_num_clusters`, `dbsql_warehouse_active_sessions`, `dbsql_warehouse_auto_stop_mins`
+
+Encoded string fields:
+
+- `dbsql_warehouse_health_status` from `warehouse_health_status`: `HEALTHY=0`, `DEGRADED=1`, `FAILED=2`, unknown/unreachable=`-1`. Alert on `>= 1`. It is set on every poll, so a failed status call (which omits the key) flips it to `-1` rather than leaving the last good value.
+- `dbsql_warehouse_state` from `warehouse_state`: `STOPPED=0`, `STARTING=1`, `RUNNING=2`, `STOPPING=3`, `DELETING=4`, `DELETED=5`, unknown=`-1`.
+
+Freshness:
+
+- `dbsql_last_poll_unixtime` per warehouse. Alert on `time() - dbsql_last_poll_unixtime` to catch a stopped exporter, alongside the scrape `up` signal.
+
+Not exported (free text): `warehouse_name`, `warehouse_size`, `warehouse_status_error`, `queue_life_p95_sentence`. `warehouse_name` could be added as a label later for readable Grafana legends; avoid putting `warehouse_size` in a label unless the value set is small.
+
+Stale series are removed each poll: if a warehouse drops out of `warehouse_workspace_map` (or a metric stops being produced), its series is dropped rather than frozen at the last value.
 
 ## Prep before this goes to a customer (TODOs)
 
 - [ ] Extract the monitor classes into an importable module (today it is a notebook).
 - [ ] Auth: the monitor reads a static `DATABRICKS_TOKEN`. Move to a **service principal (OAuth M2M)** with token refresh, injected as a k8s secret. (This is the auth spec Reid asked for; the credential needs read access to query history and to each warehouse.)
 - [ ] Resilience: wrap the monitor's `run_forever()` poll loop in try/except with backoff so an API blip or token expiry does not kill the process.
-- [ ] Stale-series cleanup in the sink: drop label sets for warehouses no longer polled.
-- [ ] Package for EKS: Dockerfile, expose the metrics port, and a k8s Deployment + Service + ServiceMonitor so Prometheus discovers and scrapes it.
+- [ ] Package for EKS: Dockerfile, keep `/metrics` off the public network, and a k8s Deployment + Service + ServiceMonitor so Prometheus discovers and scrapes it. (Rename this folder without spaces first, it is awkward in a Docker `COPY`.)
 - [ ] Confirm per-cluster granularity is not needed (the APIs attribute queries to a warehouse, not to an internal autoscaling cluster).
 
 ## Licensing note

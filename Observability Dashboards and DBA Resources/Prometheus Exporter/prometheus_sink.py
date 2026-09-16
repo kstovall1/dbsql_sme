@@ -1,48 +1,67 @@
 """
 PrometheusSink for the Real Time DBSQL Warehouse Monitor.
 
-This plugs into the monitor's existing Sink protocol, which is a single method,
-`emit(events)`. On each poll the monitor hands us a batch of MetricEvent objects.
-We update in-memory Prometheus gauges, labeled per warehouse, and a background HTTP
-server exposes /metrics for Prometheus to scrape.
+Plugs into the monitor's existing Sink protocol, a single method `emit(events)`.
+On each poll the monitor hands us a batch of MetricEvent objects; we update
+in-memory Prometheus gauges, labeled per warehouse, and a background HTTP server
+exposes /metrics for Prometheus to scrape.
 
 Design (scrape / pull):
-  The exporter runs as a long-running service. It holds the latest gauge values in
-  process memory and Prometheus scrapes the /metrics endpoint on its own interval.
-  Nothing is pushed. Hitting /metrics does NOT trigger a Databricks API call, it just
-  serializes whatever the poll loop last wrote into memory. Freshness is bounded by
-  the monitor's poll interval, not by the scrape.
+  The exporter is a long-running service. It holds the latest gauge values in
+  process memory and Prometheus scrapes /metrics on its own interval. Nothing is
+  pushed, and hitting /metrics does not trigger a Databricks API call; it just
+  serializes what the poll loop last wrote. Freshness is bounded by the monitor's
+  poll interval, not the scrape.
 
-  (A push-to-Pushgateway variant is possible and noted in the README. Hinge confirmed
-  on the Sep 16 sync that they also pull metrics, so scrape is the default here.)
-
-The sink is intentionally decoupled from the monitor module: it reads event fields by
-attribute (entity_id, workspace_host, monitor_name, ts_utc, metrics) so it does not
-need to import the monitor notebook. Wire it in as just another Sink in the sinks list.
+Key names here are taken from the monitor's actual output (`_compute_metrics`,
+`_snapshot_query_counts_from_history`, and `_fetch_warehouse_status`), not invented.
+The sink reads event fields by attribute so it does not need to import the monitor.
 """
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from prometheus_client import CollectorRegistry, Gauge, start_http_server
 
 
-# Warehouse health arrives as a string. Encode it numerically so it can be graphed
-# and alerted on. Lower is healthier; unknown values map to -1.
-_HEALTH_ENCODING: Dict[str, float] = {
-    "HEALTHY": 0.0,
-    "DEGRADED": 1.0,
-    "FAILED": 2.0,
-}
-_HEALTH_KEYS = {"warehouse_health", "health_status", "health"}
+# The monitor emits warehouse_health_status as a string. Encode it numerically so it
+# can be graphed and alerted on. Missing/unknown (e.g. a failed status poll, which
+# omits the key) maps to -1 so a previously-HEALTHY series does not stick.
+_HEALTH_KEY = "warehouse_health_status"
+_HEALTH_ENCODING: Dict[str, float] = {"HEALTHY": 0.0, "DEGRADED": 1.0, "FAILED": 2.0}
 
-# Free-text metrics that are useful in logs but are not numeric gauges.
-_SKIP_KEYS = {"queue_life_p95_sentence"}
+# warehouse_state is also a string; encode it. On a failed status poll the monitor
+# emits warehouse_state="UNKNOWN". Anything unrecognized also maps to -1.
+_STATE_KEY = "warehouse_state"
+_STATE_ENCODING: Dict[str, float] = {
+    "STOPPED": 0.0,
+    "STARTING": 1.0,
+    "RUNNING": 2.0,
+    "STOPPING": 3.0,
+    "DELETING": 4.0,
+    "DELETED": 5.0,
+    "UNKNOWN": -1.0,
+}
+
+# Handled explicitly below (not in the generic numeric loop).
+_SPECIAL_KEYS = {_HEALTH_KEY, _STATE_KEY}
+
+# String / non-metric fields that are not exported as gauges.
+# (warehouse_name / warehouse_size could become labels later; see README.)
+_SKIP_KEYS = {
+    "queue_life_p95_sentence",
+    "warehouse_name",
+    "warehouse_size",
+    "warehouse_status_error",
+}
 
 _LABELS: Tuple[str, ...] = ("warehouse_id", "workspace_host", "monitor")
+_LabelTuple = Tuple[str, str, str]
 
 
 @dataclass
@@ -51,7 +70,7 @@ class PrometheusSink:
 
     Example:
         sink = PrometheusSink(namespace="dbsql", port=9877)
-        sink.start_server()                       # start the /metrics endpoint once
+        sink.start_server()                       # start /metrics once, at startup
         monitor = DatabricksSQLMonitor(settings=settings, sinks=[sink])
         MonitorRunner(monitors=[monitor], poll_interval_seconds=30).run_forever()
     """
@@ -62,14 +81,22 @@ class PrometheusSink:
 
     # internal state
     _gauges: Dict[str, Gauge] = field(default_factory=dict, repr=False)
+    _active: Dict[str, Set[_LabelTuple]] = field(default_factory=lambda: defaultdict(set), repr=False)
     _server_started: bool = field(default=False, repr=False)
 
     # ------------------------------------------------------------------ server
-    def start_server(self, port: Optional[int] = None) -> None:
-        """Start the /metrics HTTP endpoint. Safe to call once; later calls are no-ops."""
+    def start_server(self, port: Optional[int] = None, addr: str = "0.0.0.0") -> None:
+        """Start the /metrics HTTP endpoint. Safe to call once; later calls no-op.
+
+        addr defaults to 0.0.0.0 for in-cluster scraping behind a ServiceMonitor.
+        Bind 127.0.0.1 when running locally, and keep /metrics off the public
+        network in EKS; the payload includes warehouse IDs and workspace hosts.
+        """
         if self._server_started:
             return
-        start_http_server(port if port is not None else self.port, registry=self.registry)
+        if port is not None:
+            self.port = port
+        start_http_server(self.port, addr=addr, registry=self.registry)
         self._server_started = True
 
     # ------------------------------------------------------------ Sink protocol
@@ -78,77 +105,106 @@ class PrometheusSink:
         if not events:
             return
 
+        seen: Dict[str, Set[_LabelTuple]] = defaultdict(set)
+
         for e in events:
-            labels = {
-                "warehouse_id": str(getattr(e, "entity_id", "") or ""),
-                "workspace_host": str(getattr(e, "workspace_host", "") or ""),
-                "monitor": str(getattr(e, "monitor_name", "") or ""),
-            }
+            wid = str(getattr(e, "entity_id", "") or "")
+            host = str(getattr(e, "workspace_host", "") or "")
+            mon = str(getattr(e, "monitor_name", "") or "")
+            label_tuple: _LabelTuple = (wid, host, mon)
+            labels = {"warehouse_id": wid, "workspace_host": host, "monitor": mon}
             metrics: Dict[str, Any] = getattr(e, "metrics", {}) or {}
 
+            # numeric metrics
             for key, value in metrics.items():
-                if key in _SKIP_KEYS:
+                if key in _SKIP_KEYS or key in _SPECIAL_KEYS:
                     continue
-                num = self._coerce(key, value)
+                num = self._coerce(value)
                 if num is None:
-                    continue
-                self._gauge(self._metric_name(key)).labels(**labels).set(num)
+                    continue  # dropped this poll; stale-cleanup removes any prior series
+                name = self._metric_name(key)
+                self._gauge(name, f"DBSQL warehouse monitor metric: {key}").labels(**labels).set(num)
+                seen[name].add(label_tuple)
 
-            # Freshness signal: when we last saw this warehouse. Alert on staleness
-            # (now() - last_poll_unixtime) to catch an exporter that has stopped.
-            ts = getattr(e, "ts_utc", None)
-            last = ts.timestamp() if ts is not None else time.time()
-            self._gauge(self._metric_name("last_poll_unixtime")).labels(**labels).set(last)
+            # health: always set, so a failed/absent status flips to -1 instead of sticking
+            hname = self._metric_name(_HEALTH_KEY)
+            hval = _HEALTH_ENCODING.get(str(metrics.get(_HEALTH_KEY, "")).strip().upper(), -1.0)
+            self._gauge(hname, "warehouse health: HEALTHY=0 DEGRADED=1 FAILED=2 unknown/unreachable=-1").labels(**labels).set(hval)
+            seen[hname].add(label_tuple)
+
+            # state: always set
+            sname = self._metric_name(_STATE_KEY)
+            sval = _STATE_ENCODING.get(str(metrics.get(_STATE_KEY, "")).strip().upper(), -1.0)
+            self._gauge(sname, "warehouse state: STOPPED=0 STARTING=1 RUNNING=2 STOPPING=3 DELETING=4 DELETED=5 unknown=-1").labels(**labels).set(sval)
+            seen[sname].add(label_tuple)
+
+            # freshness: alert on (time() - this) to catch a stopped exporter
+            fname = self._metric_name("last_poll_unixtime")
+            self._gauge(fname, "unix timestamp of the last poll that produced this warehouse's sample").labels(**labels).set(self._event_ts(e))
+            seen[fname].add(label_tuple)
+
+        self._prune(seen)
 
     # ------------------------------------------------------------------ helpers
-    def _coerce(self, key: str, value: Any) -> Optional[float]:
-        """Turn a metric value into a float gauge value, or None to skip it."""
+    def _prune(self, seen: Dict[str, Set[_LabelTuple]]) -> None:
+        """Remove label sets not present this poll (dropped warehouses, absent metrics)."""
+        for name, gauge in self._gauges.items():
+            stale = self._active.get(name, set()) - seen.get(name, set())
+            for lt in stale:
+                try:
+                    gauge.remove(*lt)
+                except KeyError:
+                    pass
+            self._active[name] = seen.get(name, set())
+
+    @staticmethod
+    def _coerce(value: Any) -> Optional[float]:
         if isinstance(value, bool):
             return 1.0 if value else 0.0
         if isinstance(value, (int, float)):
             return float(value)
-        if isinstance(value, str):
-            if key in _HEALTH_KEYS:
-                return _HEALTH_ENCODING.get(value.strip().upper(), -1.0)
-            # other free-text strings (e.g. state) are not exported as gauges here.
-            # TODO: encode `state` (RUNNING/STARTING/STOPPED) if you want to alert on it.
-            return None
-        return None
+        return None  # strings handled explicitly; None/other are skipped
+
+    @staticmethod
+    def _event_ts(e: Any) -> float:
+        ts = getattr(e, "ts_utc", None)
+        if ts is None:
+            return time.time()
+        try:
+            if ts.tzinfo is None:  # treat naive as UTC, not local
+                return ts.replace(tzinfo=timezone.utc).timestamp()
+            return ts.timestamp()
+        except Exception:
+            return time.time()
 
     def _metric_name(self, key: str) -> str:
-        """Namespace + sanitize to a valid Prometheus metric name."""
         safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in key)
         return f"{self.namespace}_{safe}"
 
-    def _gauge(self, name: str) -> Gauge:
+    def _gauge(self, name: str, help_text: str) -> Gauge:
         g = self._gauges.get(name)
         if g is None:
-            g = Gauge(
-                name,
-                f"DBSQL warehouse monitor metric: {name}",
-                labelnames=_LABELS,
-                registry=self.registry,
-            )
+            g = Gauge(name, help_text, labelnames=_LABELS, registry=self.registry)
             self._gauges[name] = g
         return g
 
 
 # TODO (prod hardening, see README):
-#   - Stale-series cleanup: drop label sets for warehouses no longer polled so a
-#     removed warehouse does not linger at its last value.
 #   - Auth: the monitor reads DATABRICKS_TOKEN today. Move to a service principal
 #     (OAuth M2M) with token refresh for an unattended service.
 #   - Resilience: wrap the monitor's poll loop in try/except with backoff.
+#   - Package for EKS: Dockerfile + Deployment/Service/ServiceMonitor.
 
 
 if __name__ == "__main__":
-    # Runnable demo with a synthetic event, so you can see /metrics working before
-    # wiring the real monitor. Run this file, then: curl http://localhost:9877/metrics
-    from datetime import datetime, timezone
+    # Runnable demo with a synthetic event using the monitor's REAL metric keys, so
+    # you can see /metrics before wiring the real monitor.
+    #   python "prometheus_sink.py"   then   curl http://localhost:9877/metrics
+    from datetime import datetime
     from types import SimpleNamespace
 
     sink = PrometheusSink(namespace="dbsql", port=9877)
-    sink.start_server()
+    sink.start_server(addr="127.0.0.1")  # local only for the demo
 
     demo_event = SimpleNamespace(
         monitor_name="databricks.warehouse",
@@ -156,22 +212,33 @@ if __name__ == "__main__":
         entity_id="abc123warehouse",
         ts_utc=datetime.now(timezone.utc),
         metrics={
-            "queue_depth": 3,
-            "queue_wait_seconds_p99": 4.2,
             "qps": 12.0,
-            "runtime_seconds_p95": 8.5,
+            "qpm": 720.0,
+            "current_running_queries": 4,
+            "current_queued_queries": 2,
+            "queued_p95_sec": 1.2,
+            "queued_p99_sec": 3.4,
+            "runtime_p95_sec": 8.5,
+            "runtime_p99_sec": 22.0,
             "running_concurrency_p95": 6.0,
+            "queued_concurrency_p95": 2.0,
             "failure_rate_pct": 0.0,
             "spilled_query_pct": 1.5,
-            "num_clusters": 2,
-            "max_clusters": 4,
-            "warehouse_health": "HEALTHY",
-            "state": "RUNNING",
-            "queue_life_p95_sentence": "ignored free text",
+            "queue_life_pct_p95": 12.0,
+            "warehouse_current_clusters": 2,
+            "warehouse_max_num_clusters": 4,
+            "warehouse_min_num_clusters": 1,
+            "warehouse_active_sessions": 5,
+            "warehouse_auto_stop_mins": 10,
+            "warehouse_health_status": "HEALTHY",
+            "warehouse_state": "RUNNING",
+            "warehouse_name": "analytics-wh",
+            "warehouse_size": "MEDIUM",
+            "queue_life_p95_sentence": "95% of completed queries spent <= 12% of their life queued.",
         },
     )
 
-    print("Serving metrics at http://localhost:9877/metrics  (Ctrl-C to stop)")
+    print("Serving metrics at http://127.0.0.1:9877/metrics  (Ctrl-C to stop)")
     while True:
         sink.emit([demo_event])
         time.sleep(15)
